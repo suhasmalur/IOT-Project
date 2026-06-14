@@ -1,0 +1,340 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+// Use standard WiFiClient for SSL setup on ESP8266
+#include <WiFiClientSecureBearSSL.h> 
+//-----------------------------------------
+// --- HARDWARE PIN DEFINITIONS ---
+// Standard NodeMCU SPI Pins are D5 (SCK), D6 (MISO), D7 (MOSI)
+#define RST_PIN     D3    // Reset pin for MFRC522 (GPIO 0)
+#define SS_PIN      D4    // Slave Select pin for MFRC522 (GPIO 2)
+#define BUZZER      D8    // Buzzer control pin
+// --- WIFI & URL CONFIGURATION (WARNING: Hardcoded credentials) ---
+#define WIFI_SSID   "Wifi Name"     // Enter WiFi Name
+#define WIFI_PASSWORD "Password"          // Enter WiFi Password
+// IMPORTANT: This URL is hardcoded. Use a proper secret management system for production.
+// The script must now be configured to accept both 'name' and 'uid' parameters.
+const String sheet_url = "Script url";
+//-----------------------------------------
+// --- RFID VARIABLES ---
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+MFRC522::MIFARE_Key key;  
+MFRC522::StatusCode status;      
+/* Block number to read data from (Block 2 is usually safe) */
+const int blockNum = 2;
+/* Buffer to read 16 bytes of data + 2 bytes overhead (18) */
+byte bufferLen = 18; // FIX: Removed 'const' so &bufferLen passes to MIFARE_Read
+byte readBlockData[18];
+//-----------------------------------------
+// --- GLOBAL STATE ---
+String card_holder_name;
+// NEW FLAG: Tracks if the "Scan your Card" message has been printed.
+bool system_ready_prompted = false; 
+
+// --- FUNCTION PROTOTYPES ---
+void Buzz(int duration_ms);
+bool ReadDataFromBlock(int blockNum, byte readBlockData[]); 
+String urlEncode(const String& str); 
+String getCardUID(); 
+
+/****************************************************************************************************
+ * Buzz() function - Helper to control the buzzer
+ ****************************************************************************************************/
+void Buzz(int duration_ms)
+{
+  digitalWrite(BUZZER, HIGH);
+  delay(duration_ms);
+  digitalWrite(BUZZER, LOW);
+}
+
+/****************************************************************************************************
+ * setup() function - Initializes hardware and establishes Wi-Fi connection
+ ****************************************************************************************************/
+void setup()
+{
+  Serial.begin(115200); // Increased baud rate for faster logging
+  Serial.println("\n\n--- Smart Attendance System Starting ---");
+  
+  // --- HARDWARE INITIALIZATION ---
+  pinMode(BUZZER, OUTPUT);
+  digitalWrite(BUZZER, LOW); // Ensure buzzer is off initially
+  
+  // Signal the start of initialization
+  Buzz(100);
+  delay(100);
+  Buzz(100);
+  Serial.println("Hardware initialized.");
+  
+  for (int a = 0; a < 6; a++) {
+    Serial.print(".");
+    delay(250); 
+  }
+  Serial.println();
+  
+  // --- WIFI CONNECTIVITY ---
+  Serial.print("Connecting to AP: ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int connect_attempts = 0;
+  
+  while (WiFi.status() != WL_CONNECTED && connect_attempts < 40) { // Limit attempts for better stability
+    Serial.print(".");
+    delay(500); 
+    connect_attempts++;
+    // IMPORTANT: Use yield() to prevent the ESP8266 Watchdog Timer from resetting the device.
+    yield(); 
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected.");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Buzz(50); delay(50); Buzz(50); // Triple short beep for success
+  } else {
+    Serial.println("\nWiFi connection failed after 40 attempts.");
+    Serial.println("Please check SSID/Password and restart.");
+    Buzz(500); // Long beep for failure
+    // Stop here or continue trying indefinitely
+  }
+  delay(1000);
+  //--------------------------------------------------
+  /* Initialize SPI bus and MFRC522 Module */
+  SPI.begin();
+  mfrc522.PCD_Init();
+
+  // --- MFRC522 DIAGNOSTIC CHECK ---
+  byte v = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
+  Serial.print("MFRC522 Version Register: 0x");
+  Serial.print(v, HEX);
+
+  if (v == 0x00 || v == 0xFF) {
+    Serial.println(" - WARNING: Communication failure or chip not found.");
+    Serial.println("Check your wiring, especially MISO, MOSI, SCK, and power connections.");
+    Buzz(100); delay(100); Buzz(100); delay(100); Buzz(100); // Triple error beep
+  } else {
+    Serial.println(" - SUCCESS: MFRC522 is communicating.");
+  }
+  
+  Serial.println("SYSTEM READY");
+  // Long beep to confirm system is fully operational
+  Buzz(500); 
+  delay(1000); 
+}
+
+
+/****************************************************************************************************
+ * loop() function - Main operational loop
+ ****************************************************************************************************/
+ void loop()
+{
+  // Check if WiFi dropped, and attempt reconnection before main logic
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi Disconnected. Reconnecting...");
+    // Try reconnecting in the background, non-blocking
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    delay(1000); 
+    return; // Skip the rest of the loop for this cycle
+  }
+  
+  // --- NEW LOGIC: Only display the prompt if we haven't already ---
+  if (!system_ready_prompted) {
+    Serial.println("\n------------------------------------");
+    Serial.println("Scan your Card - Attendance Ready");
+    Serial.println("------------------------------------");
+    system_ready_prompted = true; // Set flag to true so we don't print it again
+  }
+  
+  /* Look for new cards and select one */
+  if ( ! mfrc522.PICC_IsNewCardPresent()) {
+    yield(); // Keep the ESP8266 happy while idling
+    return;
+  }
+  if ( ! mfrc522.PICC_ReadCardSerial()) {
+    yield();
+    return;
+  }
+  
+  // --- A card has been detected and read, so reset the prompt flag ---
+  system_ready_prompted = false; 
+
+  Serial.println(F("\n--- Reading data from RFID ---"));
+  
+  // --- READ DATA FROM CARD ---
+  if ( !ReadDataFromBlock(blockNum, readBlockData)) {
+    // If the read failed
+    Serial.println("RFID AUTH/READ ERROR! Try again.");
+    Buzz(300); // Error buzz
+    delay(1500);
+    mfrc522.PICC_HaltA(); 
+    mfrc522.PCD_StopCrypto1(); 
+    return; 
+  }
+
+  // --- DATA PROCESSING ---
+  // Ensure the 17th byte (index 16) is a null terminator for safe String conversion.
+  readBlockData[16] = '\0';
+  
+  // Convert to String and remove leading/trailing whitespace
+  card_holder_name = String((char*)readBlockData);
+  card_holder_name.trim();
+
+  Serial.print(F("Card Holder Name: "));
+  Serial.println(card_holder_name);
+  
+  // Get the unique card UID
+  String card_uid = getCardUID();
+  Serial.print(F("Card UID: "));
+  Serial.println(card_uid);
+  
+  // Buzzer sequence for successful read
+  Buzz(100);
+  delay(100);
+  Buzz(100);
+  
+  // --- GOOGLE SHEETS CONNECTION ---
+  Serial.println("Attempting to post data to Google Sheets...");
+  std::unique_ptr<BearSSL::WiFiClientSecure>client(new BearSSL::WiFiClientSecure);
+    
+  // !!! SECURITY WARNING !!!
+  // The following line bypasses all SSL certificate validation. 
+  // DO NOT USE THIS IN A PRODUCTION ENVIRONMENT. It is used here for simplicity.
+  client->setInsecure(); 
+    
+  // --- URL ENCODING: Encode the name and append UID ---
+  String encoded_name = urlEncode(card_holder_name);
+  
+  // Construct the final URL: append UID as a second parameter
+  String full_url = sheet_url + encoded_name + "&uid=" + card_uid; // UID added here
+  Serial.print("Accessing URL: ");
+  Serial.println(full_url);
+
+  HTTPClient https;
+    
+  if (https.begin(*client, full_url)){
+      
+    Serial.print(F("[HTTPS] GET..."));
+    int httpCode = https.GET();
+      
+    if (httpCode > 0) {
+      // Successful server response (typically 200 for a successful script execution)
+      Serial.printf(" code: %d\n", httpCode);
+      if (httpCode == HTTP_CODE_OK) { // 200
+        Serial.println("Attendance Logged successfully!");
+        Buzz(50);
+      } else {
+        Serial.print("Server Error: ");
+        Serial.println(httpCode);
+        Buzz(100); delay(100); Buzz(100);
+      }
+    } else {
+      // Failed server response (e.g., DNS error, connection timeout)
+      Serial.printf("[HTTPS] GET failed, error: %s\n", https.errorToString(httpCode).c_str());
+      Serial.println("HTTP Fail: Unable to retrieve data from script.");
+      Buzz(300);
+    }
+    https.end();
+  }
+  else {
+    Serial.printf("[HTTPS] Unable to connect to Google Script\n");
+    Serial.println("Connection Failed! Script server may be down.");
+    Buzz(300);
+  }
+  
+  delay(3000); // Wait 3 seconds before next scan
+  
+  mfrc522.PICC_HaltA(); // Halt PICC for next scan
+  mfrc522.PCD_StopCrypto1(); // Stop encryption
+}
+
+
+/****************************************************************************************************
+ * ReadDataFromBlock() function - Wrapper for RFID reading logic
+ ****************************************************************************************************/
+bool ReadDataFromBlock(int blockNum, byte readBlockData[]) 
+{ 
+  // --- 1. Prepare Key ---
+  for (byte i = 0; i < 6; i++) {
+    key.keyByte[i] = 0xFF; // Default MIFARE Classic key
+  }
+  
+  // --- 2. Authenticate Block ---
+  status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, blockNum, &key, &(mfrc522.uid));
+  
+  if (status != MFRC522::STATUS_OK){
+     Serial.print("Authentication failed for Read: ");
+     Serial.println(mfrc522.GetStatusCodeName(status));
+     return false;
+  }
+  Serial.println("Authentication success.");
+  
+  // --- 3. Read Data ---
+  status = mfrc522.MIFARE_Read(blockNum, readBlockData, &bufferLen);
+  
+  if (status != MFRC522::STATUS_OK) {
+    Serial.print("Reading failed: ");
+    Serial.println(mfrc522.GetStatusCodeName(status));
+    return false;
+  }
+  
+  Serial.println("Block read successfully.");  
+  return true;
+}
+
+/****************************************************************************************************
+ * urlEncode() function - Encodes a string for safe use in a URL query parameter
+ ****************************************************************************************************/
+String urlEncode(const String& str) {
+  String encodedString = "";
+  char c;
+  char code0;
+  char code1;
+  char code2;
+  
+  for (int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    // Use '+' for spaces, which is standard for URL query parameters
+    if (c == ' ') {
+      encodedString += '+'; 
+    } else if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      // Allowed characters
+      encodedString += c;
+    } else {
+      // Encode all other characters as %HH
+      code1 = (c & 0xf) + '0';
+      if ((c & 0xf) > 9) {
+        code1 = (c & 0xf) - 10 + 'A';
+      }
+      c = (c >> 4) & 0xf;
+      code0 = c + '0';
+      if (c > 9) {
+        code0 = c - 10 + 'A';
+      }
+      encodedString += '%';
+      encodedString += code0;
+      encodedString += code1;
+    }
+    yield(); // Prevent Watchdog Timer reset during long encoding
+  }
+  return encodedString;
+}
+
+/****************************************************************************************************
+ * getCardUID() function - Converts the MFRC522 UID to a hex string
+ ****************************************************************************************************/
+String getCardUID() {
+  String uid_string = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    // Add leading zero if needed (e.g., 0A instead of A)
+    if (mfrc522.uid.uidByte[i] < 0x10) {
+      uid_string += "0";
+    }
+    // Convert byte to hex string
+    uid_string += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  // Convert the whole string to uppercase for consistency
+  uid_string.toUpperCase();
+  return uid_string;
+}
