@@ -468,20 +468,8 @@ Notify administrators automatically.
 
 ---
 
-# ⭐ Support
 
-If you found this project useful:
-
-⭐ Star this repository
-
-🍴 Fork this repository
-
-📢 Share with friends
-
-💻 Contribute to the project
-
----
-
+https://www.youtube.com/watch?v=B4yrRoj2hIM&t=9s
 
 ### "Transforming Attendance Management Through IoT"
 
